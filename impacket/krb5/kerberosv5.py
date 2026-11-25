@@ -69,6 +69,10 @@ RC4_PREFERRED_TGS_ENCTYPES = (
     int(constants.EncryptionTypes.des_cbc_md5.value),
 )
 
+# RFC 6806 suggests stopping after five referral hops.  Loop detection catches
+# cycles sooner; this bound also terminates long chains of unique realms.
+KERBEROS_MAX_REFERRALS = 5
+
 
 def getKerberosTGSRequestEnctypes(etypes=None):
     if etypes is None:
@@ -125,6 +129,84 @@ def sendReceive(data, host, kdcHost, port=88, timeout=None):
         raise krbError
 
     return r
+
+
+def _realmKey(realm):
+    return str(realm or '').upper()
+
+
+def _principalComponents(principal):
+    return [str(component) for component in principal.components]
+
+
+def _principalMatches(actual, expected, expectedRealm=None):
+    """Compare Kerberos identities without treating realm/DNS case as significant."""
+    if actual is None or expected is None:
+        return False
+
+    actualComponents = _principalComponents(actual)
+    expectedComponents = _principalComponents(expected)
+    if len(actualComponents) != len(expectedComponents):
+        return False
+
+    if actualComponents != expectedComponents:
+        # Kerberos realms and common DNS instance names are conventionally
+        # case-insensitive.  The exact comparison above still catches changes
+        # to the actual principal structure.
+        if [component.lower() for component in actualComponents] != \
+           [component.lower() for component in expectedComponents]:
+            return False
+
+    realm = expectedRealm if expectedRealm is not None else expected.realm
+    if realm:
+        return _realmKey(actual.realm) == _realmKey(realm)
+
+    return True
+
+
+def _requirePrincipalMatch(actual, expected, description, expectedRealm=None):
+    if not _principalMatches(actual, expected, expectedRealm):
+        raise KerberosValidationError(
+            "%s does not match the request identity: got %s@%s, expected %s@%s" % (
+                description,
+                _principalComponents(actual) if actual is not None else None,
+                _realmKey(actual.realm) if actual is not None else None,
+                _principalComponents(expected) if expected is not None else None,
+                _realmKey(expectedRealm if expectedRealm is not None
+                          else (expected.realm if expected is not None else None)),
+            )
+        )
+
+
+def _requireReplyNonce(encPart, expectedNonce, messageName):
+    try:
+        actualNonce = int(encPart['nonce'])
+    except (KeyError, TypeError, ValueError, PyAsn1Error) as e:
+        raise KerberosValidationError('%s is missing a valid nonce: %s' % (messageName, e))
+
+    if expectedNonce is None or actualNonce != int(expectedNonce):
+        raise KerberosValidationError(
+            '%s nonce does not match the one in the current request' % messageName
+        )
+
+
+def _principalFromAsn1(data, realmComponent, nameComponent):
+    principal = Principal()
+    principal.from_asn1(data, realmComponent, nameComponent)
+    return principal
+
+
+def _referralTargetRealm(servicePrincipal):
+    components = _principalComponents(servicePrincipal)
+    if len(components) != 2 or components[0].lower() != 'krbtgt':
+        return None
+
+    targetRealm = components[1].strip()
+    if not targetRealm or targetRealm == '.':
+        return None
+
+    return targetRealm.upper()
+
 
 def getKerberosTGT(clientName, password, domain, lmhash, nthash, aesKey='', kdcHost=None, requestPAC=True, serverName=None, kerberoast_no_preauth=False, timeout=None, certificate=None):
 
@@ -195,7 +277,8 @@ def getKerberosTGT(clientName, password, domain, lmhash, nthash, aesKey='', kdcH
     now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
     reqBody['till'] = KerberosTime.to_asn1(now)
     reqBody['rtime'] = KerberosTime.to_asn1(now)
-    reqBody['nonce'] =  rand.getrandbits(31)
+    requestNonce = rand.getrandbits(31)
+    reqBody['nonce'] = requestNonce
 
     # Yes.. this shouldn't happen but it's inherited from the past
     if aesKey is None:
@@ -297,7 +380,8 @@ def getKerberosTGT(clientName, password, domain, lmhash, nthash, aesKey='', kdcH
         # No salt for this etype (e.g. no AES key on the account), fall back to RC4.
         from impacket.ntlm import compute_lmhash, compute_nthash
         return getKerberosTGT(clientName, password, domain, compute_lmhash(password), compute_nthash(password),
-                              aesKey, kdcHost, requestPAC, serverName, kerberoast_no_preauth, timeout)
+                              aesKey, kdcHost, requestPAC, serverName, kerberoast_no_preauth, timeout,
+                              certificate=certificate)
     else:
         key = cipher.string_to_key(password, encryptionTypesData[enctype], None)
 
@@ -357,7 +441,8 @@ def getKerberosTGT(clientName, password, domain, lmhash, nthash, aesKey='', kdcH
         now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
         reqBody['till'] = KerberosTime.to_asn1(now)
         reqBody['rtime'] =  KerberosTime.to_asn1(now)
-        reqBody['nonce'] = rand.getrandbits(31)
+        requestNonce = rand.getrandbits(31)
+        reqBody['nonce'] = requestNonce
 
         seq_set_iter(reqBody, 'etype', ( (int(cipher.enctype),)))
 
@@ -369,7 +454,9 @@ def getKerberosTGT(clientName, password, domain, lmhash, nthash, aesKey='', kdcH
                     from impacket.ntlm import compute_lmhash, compute_nthash
                     lmhash = compute_lmhash(password)
                     nthash = compute_nthash(password)
-                    return getKerberosTGT(clientName, password, domain, lmhash, nthash, aesKey, kdcHost, requestPAC, timeout=timeout)
+                    return getKerberosTGT(clientName, password, domain, lmhash, nthash, aesKey, kdcHost,
+                                          requestPAC, serverName, kerberoast_no_preauth, timeout,
+                                          certificate=certificate)
             raise
 
 
@@ -400,11 +487,16 @@ def getKerberosTGT(clientName, password, domain, lmhash, nthash, aesKey='', kdcH
         raise
     encASRepPart = decoder.decode(plainText, asn1Spec = EncASRepPart())[0]
 
+    # Bind the encrypted reply to the exact AS request that generated it.
+    _requireReplyNonce(encASRepPart, requestNonce, 'AS-REP')
+    replyClient = _principalFromAsn1(asRep, 'crealm', 'cname')
+    _requirePrincipalMatch(replyClient, clientName, 'AS-REP client identity', domain)
+    replyServer = _principalFromAsn1(encASRepPart, 'srealm', 'sname')
+    _requirePrincipalMatch(replyServer, serverName, 'AS-REP server identity', domain)
+
     # Get the session key and the ticket
     cipher = _enctype_table[encASRepPart['key']['keytype']]
     sessionKey = Key(cipher.enctype,encASRepPart['key']['keyvalue'].asOctets())
-
-    # ToDo: Check Nonces!
 
     return tgt, cipher, key, sessionKey
 
@@ -412,119 +504,178 @@ def getKerberosTGS(serverName, domain, kdcHost, tgt, cipher, sessionKey, renew =
 
     requestEtypes = getKerberosTGSRequestEnctypes(etypes)
 
-    # Decode the TGT
-    try:
-        decodedTGT = decoder.decode(tgt, asn1Spec = AS_REP())[0]
-    except:
-        decodedTGT = decoder.decode(tgt, asn1Spec = TGS_REP())[0]
-
     domain = domain.upper()
-    # Extract the ticket from the TGT
-    ticket = Ticket()
-    ticket.from_asn1(decodedTGT['ticket'])
+    currentTGT = tgt
+    replyCipher = cipher
+    replySessionKey = sessionKey
+    visitedRealms = set()
+    referralCount = 0
 
-    # An inter-realm TGT is only accepted by the realm its krbtgt names, not by the realm that issued it
-    tgtService = ticket.service_principal
-    if len(tgtService.components) == 2 and tgtService.components[0].lower() == 'krbtgt' and tgtService.realm.upper() == domain:
-        domain = tgtService.components[1].upper()
+    while True:
+        # Decode the ticket used to authenticate this TGS request.
+        try:
+            decodedTGT = decoder.decode(currentTGT, asn1Spec = AS_REP())[0]
+        except:
+            decodedTGT = decoder.decode(currentTGT, asn1Spec = TGS_REP())[0]
 
-    apReq = AP_REQ()
-    apReq['pvno'] = 5
-    apReq['msg-type'] = int(constants.ApplicationTagNumbers.AP_REQ.value)
+        # Extract the ticket from the TGT
+        ticket = Ticket()
+        ticket.from_asn1(decodedTGT['ticket'])
 
-    opts = list()
-    apReq['ap-options'] =  constants.encodeFlags(opts)
-    seq_set(apReq,'ticket', ticket.to_asn1)
+        # An inter-realm TGT is only accepted by the realm its krbtgt names, not by the realm that issued it
+        tgtService = ticket.service_principal
+        if len(tgtService.components) == 2 and tgtService.components[0].lower() == 'krbtgt' and \
+                _realmKey(tgtService.realm) == domain:
+            domain = _realmKey(tgtService.components[1])
 
-    authenticator = Authenticator()
-    authenticator['authenticator-vno'] = 5
-    authenticator['crealm'] = decodedTGT['crealm'].asOctets()
+        if domain in visitedRealms:
+            raise KerberosValidationError(
+                'cross-realm referral loop detected at realm %s' % domain
+            )
+        visitedRealms.add(domain)
 
-    clientName = Principal()
-    clientName.from_asn1( decodedTGT, 'crealm', 'cname')
+        apReq = AP_REQ()
+        apReq['pvno'] = 5
+        apReq['msg-type'] = int(constants.ApplicationTagNumbers.AP_REQ.value)
 
-    seq_set(authenticator, 'cname', clientName.components_to_asn1)
+        opts = list()
+        apReq['ap-options'] =  constants.encodeFlags(opts)
+        seq_set(apReq,'ticket', ticket.to_asn1)
 
-    now = datetime.datetime.now(datetime.timezone.utc)
-    authenticator['cusec'] =  now.microsecond
-    authenticator['ctime'] = KerberosTime.to_asn1(now)
+        authenticator = Authenticator()
+        authenticator['authenticator-vno'] = 5
+        authenticator['crealm'] = decodedTGT['crealm'].asOctets()
 
-    encodedAuthenticator = encoder.encode(authenticator)
+        clientName = Principal()
+        clientName.from_asn1( decodedTGT, 'crealm', 'cname')
 
-    # Key Usage 7
-    # TGS-REQ PA-TGS-REQ padata AP-REQ Authenticator (includes
-    # TGS authenticator subkey), encrypted with the TGS session
-    # key (Section 5.5.1)
-    encryptedEncodedAuthenticator = cipher.encrypt(sessionKey, 7, encodedAuthenticator, None)
+        seq_set(authenticator, 'cname', clientName.components_to_asn1)
 
-    apReq['authenticator'] = noValue
-    apReq['authenticator']['etype'] = cipher.enctype
-    apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
+        now = datetime.datetime.now(datetime.timezone.utc)
+        authenticator['cusec'] =  now.microsecond
+        authenticator['ctime'] = KerberosTime.to_asn1(now)
 
-    encodedApReq = encoder.encode(apReq)
+        encodedAuthenticator = encoder.encode(authenticator)
 
-    tgsReq = TGS_REQ()
+        # Key Usage 7
+        # TGS-REQ PA-TGS-REQ padata AP-REQ Authenticator (includes
+        # TGS authenticator subkey), encrypted with the TGS session
+        # key (Section 5.5.1)
+        encryptedEncodedAuthenticator = replyCipher.encrypt(replySessionKey, 7, encodedAuthenticator, None)
 
-    tgsReq['pvno'] =  5
-    tgsReq['msg-type'] = int(constants.ApplicationTagNumbers.TGS_REQ.value)
-    tgsReq['padata'] = noValue
-    tgsReq['padata'][0] = noValue
-    tgsReq['padata'][0]['padata-type'] = int(constants.PreAuthenticationDataTypes.PA_TGS_REQ.value)
-    tgsReq['padata'][0]['padata-value'] = encodedApReq
+        apReq['authenticator'] = noValue
+        apReq['authenticator']['etype'] = replyCipher.enctype
+        apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
 
-    reqBody = seq_set(tgsReq, 'req-body')
+        encodedApReq = encoder.encode(apReq)
 
-    opts = list()
-    opts.append( constants.KDCOptions.forwardable.value )
-    opts.append( constants.KDCOptions.renewable.value )
-    opts.append( constants.KDCOptions.renewable_ok.value )
-    opts.append( constants.KDCOptions.canonicalize.value )
+        tgsReq = TGS_REQ()
 
-    if renew == True:
-        opts.append( constants.KDCOptions.renew.value )
+        tgsReq['pvno'] =  5
+        tgsReq['msg-type'] = int(constants.ApplicationTagNumbers.TGS_REQ.value)
+        tgsReq['padata'] = noValue
+        tgsReq['padata'][0] = noValue
+        tgsReq['padata'][0]['padata-type'] = int(constants.PreAuthenticationDataTypes.PA_TGS_REQ.value)
+        tgsReq['padata'][0]['padata-value'] = encodedApReq
 
-    reqBody['kdc-options'] = constants.encodeFlags(opts)
-    seq_set(reqBody, 'sname', serverName.components_to_asn1)
-    reqBody['realm'] = domain
+        reqBody = seq_set(tgsReq, 'req-body')
 
-    now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
+        opts = list()
+        opts.append( constants.KDCOptions.forwardable.value )
+        opts.append( constants.KDCOptions.renewable.value )
+        opts.append( constants.KDCOptions.renewable_ok.value )
+        opts.append( constants.KDCOptions.canonicalize.value )
 
-    reqBody['till'] = KerberosTime.to_asn1(now)
-    reqBody['nonce'] = rand.getrandbits(31)
-    seq_set_iter(reqBody, 'etype', requestEtypes)
+        # The historical recursive call did not forward renew=True to referral hops.
+        if renew and referralCount == 0:
+            opts.append( constants.KDCOptions.renew.value )
 
-    message = encoder.encode(tgsReq)
-    r = sendReceive(message, domain, kdcHost, timeout=timeout)
+        reqBody['kdc-options'] = constants.encodeFlags(opts)
+        seq_set(reqBody, 'sname', serverName.components_to_asn1)
+        reqBody['realm'] = domain
 
-    # Get the session key
+        now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
 
-    tgs = decoder.decode(r, asn1Spec = TGS_REP())[0]
+        reqBody['till'] = KerberosTime.to_asn1(now)
+        requestNonce = rand.getrandbits(31)
+        reqBody['nonce'] = requestNonce
+        seq_set_iter(reqBody, 'etype', requestEtypes)
 
-    cipherText = tgs['enc-part']['cipher']
+        message = encoder.encode(tgsReq)
+        r = sendReceive(message, domain, kdcHost, timeout=timeout)
 
-    # Key Usage 8
-    # TGS-REP encrypted part (includes application session
-    # key), encrypted with the TGS session key (Section 5.4.2)
-    plainText = cipher.decrypt(sessionKey, 8, cipherText)
+        tgs = decoder.decode(r, asn1Spec = TGS_REP())[0]
 
-    encTGSRepPart = decoder.decode(plainText, asn1Spec = EncTGSRepPart())[0]
+        cipherText = tgs['enc-part']['cipher']
 
-    newSessionKey = Key(encTGSRepPart['key']['keytype'], encTGSRepPart['key']['keyvalue'].asOctets())
-    # Creating new cipher based on received keytype
-    cipher = _enctype_table[encTGSRepPart['key']['keytype']]
+        # Key Usage 8
+        # TGS-REP encrypted part (includes application session
+        # key), encrypted with the TGS session key (Section 5.4.2)
+        plainText = replyCipher.decrypt(replySessionKey, 8, cipherText)
 
-    # Check we've got what we asked for
-    res = decoder.decode(r, asn1Spec = TGS_REP())[0]
-    spn = Principal()
-    spn.from_asn1(res['ticket'], 'realm', 'sname')
+        encTGSRepPart = decoder.decode(plainText, asn1Spec = EncTGSRepPart())[0]
 
-    if spn.components[0] == serverName.components[0]:
-        # Yes.. bye bye
-        return r, cipher, sessionKey, newSessionKey
-    else:
-        # Let's extract the Ticket, change the domain and keep asking
-        domain = spn.components[1]
-        return getKerberosTGS(serverName, domain, kdcHost, r, cipher, newSessionKey, etypes=requestEtypes, timeout=timeout)
+        # The encrypted part is bound to this exact request and to the client
+        # identity authenticated by the TGT.
+        _requireReplyNonce(encTGSRepPart, requestNonce, 'TGS-REP')
+        replyClient = _principalFromAsn1(tgs, 'crealm', 'cname')
+        _requirePrincipalMatch(replyClient, clientName, 'TGS-REP client identity')
+
+        # The encrypted KDC reply names the service.  Require it to agree with
+        # the unencrypted ticket principal before that ticket can be used.
+        ticketServer = _principalFromAsn1(tgs['ticket'], 'realm', 'sname')
+        encryptedServer = _principalFromAsn1(encTGSRepPart, 'srealm', 'sname')
+        _requirePrincipalMatch(encryptedServer, ticketServer,
+                               'TGS-REP encrypted service identity')
+        if _realmKey(ticketServer.realm) != domain:
+            raise KerberosValidationError(
+                'TGS-REP realm %s does not match the realm in the current request (%s)' % (
+                    _realmKey(ticketServer.realm), domain,
+                )
+            )
+
+        # A terminal ticket must be for the service asked for.  A different
+        # krbtgt/<realm> is the only response allowed to drive another hop.
+        terminalTicket = _principalMatches(ticketServer, serverName, domain)
+        nextDomain = None if terminalTicket else _referralTargetRealm(ticketServer)
+        if not terminalTicket and nextDomain is None:
+            raise KerberosValidationError(
+                'TGS-REP service %s@%s does not match requested service %s and is not a cross-realm referral' % (
+                    _principalComponents(ticketServer), _realmKey(ticketServer.realm),
+                    _principalComponents(serverName),
+                )
+            )
+
+        if nextDomain is not None:
+            # Also require the encrypted identity to name the same referral target.
+            encryptedReferralDomain = _referralTargetRealm(encryptedServer)
+            if encryptedReferralDomain != nextDomain or \
+                    _realmKey(encryptedServer.realm) != _realmKey(ticketServer.realm):
+                raise KerberosValidationError('inconsistent cross-realm referral identity')
+
+            if nextDomain in visitedRealms:
+                raise KerberosValidationError(
+                    'cross-realm referral loop detected: %s -> %s' % (domain, nextDomain)
+                )
+            if referralCount >= KERBEROS_MAX_REFERRALS:
+                raise KerberosValidationError(
+                    'too many cross-realm referrals (limit %d)' % KERBEROS_MAX_REFERRALS
+                )
+
+        newSessionKey = Key(encTGSRepPart['key']['keytype'], encTGSRepPart['key']['keyvalue'].asOctets())
+        # Creating new cipher based on received keytype
+        newCipher = _enctype_table[encTGSRepPart['key']['keytype']]
+
+        if terminalTicket:
+            # Yes.. bye bye.  Do not expose any intermediate referral state.
+            return r, newCipher, replySessionKey, newSessionKey
+
+        # Commit the next hop only after the complete reply has passed validation.
+        currentTGT = r
+        replyCipher = newCipher
+        replySessionKey = newSessionKey
+        domain = nextDomain
+        referralCount += 1
 
 ################################################################################
 # DCE RPC Helpers
@@ -800,3 +951,18 @@ class KerberosError(SessionError):
             pass
 
         return retString
+
+
+class KerberosValidationError(KerberosError, ValueError):
+    """A decrypted KDC reply failed request/identity or referral validation."""
+
+    def __init__(self, message):
+        KerberosError.__init__(
+            self,
+            error=int(constants.ErrorCodes.KRB_ERR_GENERIC.value),
+        )
+        ValueError.__init__(self, message)
+        self.message = message
+
+    def __str__(self):
+        return 'Kerberos validation error: %s [%s]' % (self.message, KerberosError.__str__(self))
